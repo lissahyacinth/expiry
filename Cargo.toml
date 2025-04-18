@@ -1,0 +1,23 @@
+[package]
+name = "expiry"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parking_lot = "0.12"
+thiserror = "2"
+tracing = "0.1"
+rusqlite = { version = "0.34", optional = true }
+time = "0.3.41"
+bitcode = { version = "0.6.6" , optional = true}
+
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+
+[features]
+sqlite = ["rusqlite", "bitcode"]
+
+[profile.test.package."*"]
+opt-level = 3
