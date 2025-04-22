@@ -1,6 +1,5 @@
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
 use time::OffsetDateTime;
 
 const DEFAULT_WAIT: usize = 500;
@@ -25,7 +24,7 @@ pub(crate) fn next_expiry(maybe_event_wakeup: Option<time::OffsetDateTime>) -> t
 
 pub(crate) fn timeout_occurred(receiver: &Receiver<()>, duration: time::Duration) -> bool {
     match receiver.recv_timeout(
-        Duration::try_from(duration)
+        std::time::Duration::try_from(duration)
             .expect("Could not convert from time::Duration to std::time::Duration"),
     ) {
         Ok(_) => {

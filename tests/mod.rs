@@ -2,7 +2,7 @@
 mod test {
     #[cfg(feature = "sqlite")]
     use expiry::SqliteWaker;
-    use expiry::{ExpiryResult, InMemoryWaker, PerformOnSchedule, Scheduler};
+    use expiry::{ExpiryResult, InMemoryWaker, PerformOnSchedule, ScheduleOps};
     use parking_lot::{Mutex, Once};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +14,8 @@ mod test {
 
     fn test_event_cancellation<S, F>(create_scheduler: F)
     where
-        S: Scheduler<usize, usize>,
-        F: FnOnce(PerformOnSchedule<usize>) -> S,
+        S: ScheduleOps<usize, usize>,
+        F: FnOnce(PerformOnSchedule<usize, usize>) -> S,
     {
         START.call_once(|| {
             tracing_subscriber::fmt()
@@ -35,12 +35,14 @@ mod test {
         let processed_events = Arc::new(Mutex::new(Vec::new()));
         let processed_clone = Arc::clone(&processed_events);
 
-        let on_wake = move |value: &usize| -> ExpiryResult<()> {
+        let on_wake = move |value: &usize,
+                            _scheduler: Arc<dyn ScheduleOps<usize, usize>>|
+              -> ExpiryResult<()> {
             processed_clone.lock().push(*value);
             Ok(())
         };
 
-        let mut store = create_scheduler(Box::new(on_wake));
+        let store = create_scheduler(Box::new(on_wake));
 
         store
             .schedule(1, 10, time::Duration::milliseconds(50))
@@ -64,8 +66,8 @@ mod test {
 
     fn test_scheduler_impl<S, F>(create_scheduler: F)
     where
-        S: Scheduler<usize, usize>,
-        F: FnOnce(PerformOnSchedule<usize>) -> S,
+        S: ScheduleOps<usize, usize>,
+        F: FnOnce(PerformOnSchedule<usize, usize>) -> S,
     {
         START.call_once(|| {
             tracing_subscriber::fmt()
@@ -85,13 +87,13 @@ mod test {
         let atomic_counter = Arc::new(AtomicU64::new(0));
         let atomic_arc_clone = Arc::clone(&atomic_counter);
 
-        let on_wake = move |value: &usize| -> ExpiryResult<()> {
+        let on_wake = move |value: &usize, _scheduler: Arc<dyn ScheduleOps<usize, usize>>| -> ExpiryResult<()> {
             atomic_arc_clone.fetch_add(*value as u64, Ordering::Acquire);
             tracing::info!("Processed event with value {}", value);
             Ok(())
         };
 
-        let mut store = create_scheduler(Box::new(on_wake));
+        let store = create_scheduler(Box::new(on_wake));
 
         store
             .schedule(1, 1, time::Duration::seconds(1000))

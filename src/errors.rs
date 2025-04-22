@@ -2,7 +2,7 @@ use thiserror::Error;
 
 pub type ExpiryResult<T> = Result<T, ExpiryError>;
 
-#[derive(Error, Debug, Clone, PartialEq)]
+#[derive(Error, Debug)]
 pub enum ExpiryError {
     #[error("Generic: {0}")]
     Generic(String),
@@ -17,4 +17,8 @@ pub enum ExpiryError {
     /// Error occurred during communication between threads
     #[error("Communication error: {0}")]
     Communication(String),
+
+    #[cfg(feature = "sqlite")]
+    #[error("Could not encode value")]
+    EncodeError(#[from] bincode::error::EncodeError),
 }
