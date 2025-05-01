@@ -1,6 +1,8 @@
 use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use time::OffsetDateTime;
+use crate::{ExpiryResult, HashableKey, ScheduleOps, WritableValue};
+use crate::message::{ScheduleMessage, ScheduleMessageReply};
 
 const DEFAULT_WAIT: usize = 500;
 
@@ -22,20 +24,66 @@ pub(crate) fn next_expiry(maybe_event_wakeup: Option<time::OffsetDateTime>) -> t
     }
 }
 
-pub(crate) fn timeout_occurred(receiver: &Receiver<()>, duration: time::Duration) -> bool {
-    match receiver.recv_timeout(
+pub(crate) fn timeout_occurred<K, V>(
+    scheduler: &mut dyn ScheduleOps<K, V>,
+    schedule_caller: &Receiver<ScheduleMessage<K, V>>,
+    schedule_reply: &Sender<ScheduleMessageReply>,
+    duration: time::Duration
+) -> ExpiryResult<bool> where
+    K: HashableKey,
+    V: WritableValue,
+{
+    match schedule_caller.recv_timeout(
         std::time::Duration::try_from(duration)
             .expect("Could not convert from time::Duration to std::time::Duration"),
     ) {
-        Ok(_) => {
-            tracing::debug!("Received wakeup event");
-            false
+        Ok(schedule_message) => {
+            match schedule_message {
+                ScheduleMessage::ScheduleAt(schedule_event) => {
+                    match scheduler.schedule_at(schedule_event.key, schedule_event.value, schedule_event.at) {
+                        Ok(_) => {
+                            let _ = schedule_reply.send(ScheduleMessageReply::Succeeded);
+                        }
+                        Err(_) => {
+                            let _ = schedule_reply.send(ScheduleMessageReply::Failed);
+                        }
+                    };
+                    Ok(false)
+                }
+                ScheduleMessage::Cancel(cancel_event) => {
+                    match scheduler.cancel(cancel_event.key) {
+                        Ok(_) => {
+                        let _ = schedule_reply.send(ScheduleMessageReply::Succeeded);
+                    }
+                    Err(_) => {
+                        let _ = schedule_reply.send(ScheduleMessageReply::Failed);
+                    }
+                };
+                    Ok(false)
+                }
+                ScheduleMessage::Purge() => {
+                    match scheduler.purge() {
+                        Ok(_) => {
+                        let _ = schedule_reply.send(ScheduleMessageReply::Succeeded);
+                    }
+                    Err(_) => {
+                        let _ = schedule_reply.send(ScheduleMessageReply::Failed);
+                    }
+                };
+                    Ok(false)
+                }
+                ScheduleMessage::Wakeup() => {
+                    tracing::debug!("Received wakeup event");
+                    Ok(false)
+                }
+            }
+
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => true,
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(true),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             // Channel closed
             tracing::error!("Wakeup channel sender disconnected - shutting down");
-            false
+            Ok(false)
         }
     }
 }

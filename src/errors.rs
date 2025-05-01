@@ -1,3 +1,4 @@
+use std::sync::mpsc::SendError;
 use thiserror::Error;
 
 pub type ExpiryResult<T> = Result<T, ExpiryError>;
@@ -22,3 +23,4 @@ pub enum ExpiryError {
     #[error("Could not encode value")]
     EncodeError(#[from] bincode::error::EncodeError),
 }
+

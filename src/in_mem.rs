@@ -1,6 +1,6 @@
 use crate::errors::ExpiryResult;
 use crate::timing::{next_expiry, timeout_occurred};
-use crate::{HashableKey, PerformOnSchedule, SchedulableObject, ScheduleOps, WritableValue};
+use crate::{ExpiryError, HashableKey, PerformOnSchedule, SchedulableObject, ScheduleOps, WritableValue};
 use parking_lot::Mutex;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -10,66 +10,34 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
 use time::OffsetDateTime;
+use crate::message::{check_reply, Cancel, ScheduleAt, ScheduleMessage, ScheduleMessageReply};
 
 type OrderedSchedulableEvents<K, V> = BinaryHeap<Reverse<SchedulableObject<K, V>>>;
 
-pub struct InnerScheduler<K, V>
+pub struct InnerScheduler<K, V, F>
 where
     K: HashableKey,
     V: WritableValue,
+    F: Fn(&V, &Box<dyn ScheduleOps<K, V>>)
 {
-    events: Arc<Mutex<OrderedSchedulableEvents<K, V>>>,
-    cancelled_events: Arc<Mutex<Vec<K>>>,
-    wakeup_sender: Sender<()>,
+    // TODO: RefCell is more appropriate, but means lifetime rules.
+    events: Mutex<OrderedSchedulableEvents<K, V>>,
+    cancelled_events: Mutex<Vec<K>>,
+    schedule_message_channel: Receiver<ScheduleMessage<K, V>>,
+    schedule_message_reply_channel: Sender<ScheduleMessageReply>,
+    callback: Box<F>
 }
 
-impl<K, V> InnerScheduler<K, V>
+impl<K, V, F> ScheduleOps<K, V> for InnerScheduler<K, V, F>
 where
     K: HashableKey,
     V: WritableValue,
-{
-    fn new(
-        events: Arc<Mutex<OrderedSchedulableEvents<K, V>>>,
-        cancelled_events: Arc<Mutex<Vec<K>>>,
-        wakeup_sender: Sender<()>,
-    ) -> Self {
-        Self {
-            events,
-            cancelled_events,
-            wakeup_sender,
-        }
-    }
-}
-
-impl<K, V> ScheduleOps<K, V> for InnerScheduler<K, V>
-where
-    K: HashableKey,
-    V: WritableValue,
+    F: Fn(&V, &Box<dyn ScheduleOps<K, V>>)
 {
     fn schedule_at(&self, key: K, value: V, at: OffsetDateTime) -> ExpiryResult<()> {
-        tracing::debug!("Add new event to wake up at {}", at);
-        let maybe_next_wakeup_time = self.events.lock().peek().map(|e| e.0.expires_at_time);
         self.events
             .lock()
             .push(Reverse(SchedulableObject::new(at, key, value)));
-        match maybe_next_wakeup_time {
-            None => {
-                // We could be on default sleep time - set a wakeup
-                self.wakeup_sender
-                    .send(())
-                    .expect("Receiver is not available");
-            }
-            Some(next_planned_wake_up) => {
-                if next_planned_wake_up > at {
-                    tracing::debug!(
-                        "Sending message to wake early - new scheduled item is earlier than current wakeup time"
-                    );
-                    self.wakeup_sender
-                        .send(())
-                        .expect("Receiver is not available");
-                }
-            }
-        }
         Ok(())
     }
 
@@ -88,15 +56,37 @@ where
     }
 }
 
+impl<K, V, F> InnerScheduler<K, V, F>
+where
+    K: HashableKey,
+    V: WritableValue,
+    F: Fn(&V, &Box<dyn ScheduleOps<K, V>>)
+{
+    fn new(
+        events: OrderedSchedulableEvents<K, V>,
+        cancelled_events: Vec<K>,
+        schedule_message_channel: Receiver<ScheduleMessage<K, V>>,
+        schedule_message_reply_channel: Sender<ScheduleMessageReply>,
+        callback: Box<F>
+    ) -> Self {
+        Self {
+            events: Mutex::new(events),
+            cancelled_events: Mutex::new(cancelled_events),
+            schedule_message_channel,
+            schedule_message_reply_channel,
+            callback
+        }
+    }
+}
+
 pub struct InMemoryWaker<K, V>
 where
     K: HashableKey,
     V: WritableValue,
 {
-    wakeup_sender: Sender<()>,
-    shutdown: Arc<AtomicBool>,
+    schedule_message_channel: Sender<ScheduleMessage<K, V>>,
+    schedule_message_reply_channel: Receiver<ScheduleMessageReply>,
     _processor_thread: JoinHandle<()>,
-    scheduler: Arc<InnerScheduler<K, V>>,
 }
 
 impl<K, V> ScheduleOps<K,V> for InMemoryWaker<K, V>
@@ -105,42 +95,45 @@ where
     V: WritableValue,
 {
     fn schedule_at(&self, key: K, value: V, at: OffsetDateTime) -> ExpiryResult<()> {
-        self.scheduler.schedule_at(key, value, at)
+        self.schedule_message_channel.send(
+            ScheduleMessage::ScheduleAt(ScheduleAt::new(key, value, at))
+        ).map_err(|e| ExpiryError::Communication(
+            format!("Could not send schedule_at message due to {}", e)))?;
+        check_reply(&self.schedule_message_reply_channel)
     }
 
     fn cancel(&self, key: K) -> ExpiryResult<()> {
-        self.scheduler.cancel(key)
+        self.schedule_message_channel.send(
+            ScheduleMessage::Cancel(Cancel::new(key))
+        ).map_err(|e| ExpiryError::Communication(
+            format!("Could not send cancel message due to {}", e)))?;
+        check_reply(&self.schedule_message_reply_channel)
     }
 
     fn purge(&self) -> ExpiryResult<()> {
-        self.scheduler.purge()
+        self.schedule_message_channel.send(
+            ScheduleMessage::Purge()
+        ).map_err(|e| ExpiryError::Communication(
+            format!("Could not send purge message due to {}", e)))?;
+        check_reply(&self.schedule_message_reply_channel)
     }
 }
 
-impl<K, V> InMemoryWaker<K, V>
+impl<K, V, F> InnerScheduler<K, V, F>
 where
     K: HashableKey,
     V: WritableValue,
+    F: Fn(&V, &Box<dyn ScheduleOps<K, V>>)
 {
-    fn process_expiry(
-        events: Arc<Mutex<OrderedSchedulableEvents<K, V>>>,
-        cancelled_events: Arc<Mutex<Vec<K>>>,
-        shutdown: Arc<AtomicBool>,
-        wakeup_receiver: Receiver<()>,
-        callback: PerformOnSchedule<K, V>,
-        scheduler: Arc<InnerScheduler<K, V>>,
-    ) {
+    fn process_expiry(&mut self) {
         loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
             let sleep_duration = {
-                let lock = events.lock();
+                let lock = self.events.lock();
                 next_expiry(lock.peek().map(|e| e.0.expires_at_time))
             };
-            if timeout_occurred(&wakeup_receiver, sleep_duration) {
-                let mut events_lock = events.lock();
-                let cancelled_events_lock = cancelled_events.lock();
+                if timeout_occurred(self, &self.schedule_message_channel, &self.schedule_message_reply_channel, sleep_duration).unwrap() {
+                let mut events_lock = self.events.lock();
+                let cancelled_events_lock = self.cancelled_events.lock();
                 let can_remove_event = if let Some(Reverse(event)) = events_lock.peek() {
                     if cancelled_events_lock.contains(&event.id) {
                         tracing::debug!(key = ?event.id, "Event was marked as cancelled, ignoring");
@@ -149,7 +142,7 @@ where
                         tracing::debug!("Looking at event at time {}", event.expires_at_time);
                         if event.expires_at_time <= OffsetDateTime::now_utc() {
                             tracing::debug!(key = ?event.id, "Processing event");
-                            if let Err(e) = callback(&event.data, scheduler.clone()) {
+                            if let Err(e) = self.callback(&event.data, &self) {
                                 tracing::warn!(key = ?event.id, error = ?e, "Event processing failed, will retry");
                                 false
                             } else {
@@ -179,7 +172,7 @@ where
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         // Wakeup the background thread so that it checks the shutdown flag
-        let _ = self.wakeup_sender.send(());
+        let _ = self.schedule_message_channel.send(ScheduleMessage::Wakeup());
     }
 }
 
@@ -188,39 +181,25 @@ where
     K: HashableKey,
     V: WritableValue,
 {
-    pub fn new(callback: PerformOnSchedule<K, V>) -> Self {
-        let (wakeup_sender, wakeup_receiver) = mpsc::channel();
-        let shared_data = Arc::new(Mutex::new(BinaryHeap::new()));
-        let shared_cancellations = Arc::new(Mutex::new(Vec::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let inner_scheduler = Arc::new(InnerScheduler::new(
-            shared_data.clone(),
-            shared_cancellations.clone(),
-            wakeup_sender.clone(),
-        ));
-
-        let thread_events = Arc::clone(&shared_data.clone());
-        let thread_cancellations = Arc::clone(&shared_cancellations);
-        let thread_shutdown = Arc::clone(&shutdown);
-        let thread_scheduler = Arc::clone(&inner_scheduler);
+    pub fn new(callback: Box<dyn Fn(&V, &Box<dyn ScheduleOps<K, V>>) + Send + Sync>) -> Self {
+        let (inner_scheduler_function_sender, inner_scheduler_function_receiver) = mpsc::channel();
+        let (inner_scheduler_reply_sender, inner_scheduler_reply_receiver) = mpsc::channel();
 
         let processor_thread = thread::spawn(move || {
-            Self::process_expiry(
-                thread_events,
-                thread_cancellations,
-                thread_shutdown,
-                wakeup_receiver,
-                callback,
-                thread_scheduler,
+            let mut scheduler = InnerScheduler::new(
+                BinaryHeap::new(),
+                Vec::new(),
+                inner_scheduler_function_receiver,
+                inner_scheduler_reply_sender,
+                callback
             );
+            scheduler.process_expiry();
         });
 
         Self {
-            wakeup_sender,
-            shutdown,
+            schedule_message_channel: inner_scheduler_function_sender,
+            schedule_message_reply_channel: inner_scheduler_reply_receiver,
             _processor_thread: processor_thread,
-            scheduler: inner_scheduler,
         }
     }
 }

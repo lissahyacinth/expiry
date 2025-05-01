@@ -4,10 +4,10 @@ pub use in_mem::InMemoryWaker;
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteWaker;
-mod consts;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod timing;
+mod message;
 
 pub use crate::errors::ExpiryError;
 pub use crate::errors::ExpiryResult;
@@ -53,7 +53,7 @@ impl<T> WritableValue for T where T: Sized + Send + Sync + 'static {}
 pub trait WritableValue: Sized + Send + Sync + 'static {}
 
 pub type PerformOnSchedule<K, V> =
-    Box<dyn Fn(&V, Arc<dyn ScheduleOps<K, V>>) -> ExpiryResult<()> + Send + 'static>;
+    Box<dyn Fn(&V, ScheduleOps<K, V>) -> ExpiryResult<()> + Send + 'static>;
 
 pub trait ScheduleOps<K, V>
 where
